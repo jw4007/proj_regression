@@ -1,0 +1,277 @@
+---
+title: "Regression Analysis"
+output:   
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r,include=FALSE,message=FALSE,echo=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(broom)
+library(plotly)
+library(highcharter)
+library(rworldmap)
+library(gganimate)
+library(transformr)
+library(corrplot)
+library(leaps)
+library(kableExtra)
+library(modelr)
+library(mgcv)
+knitr::opts_chunk$set(
+ echo = FALSE,
+ fig.width = 7, 
+ fig.height = 5,
+ fig.asp = 0.6,
+ out.width = "60%")
+theme_set(theme_bw() + 
+          theme(legend.position = "bottom",
+                legend.title = element_blank(),
+                plot.title = element_text(hjust = 0.5, size = 15),
+                plot.subtitle = element_text(hjust = 0.5, size = 12)))
+
+
+```
+
+### Data Import and Cleaning
+
+
+#### HIV Deaths By Country Dataset
+
+```{r, message = FALSE,warning = FALSE}
+deaths = read_csv("data/final_hiv_deaths.csv") %>%
+ janitor::clean_names() %>%
+ select("location_id", "location_name", starts_with("sex"), starts_with("age"), "year", "val", "upper", "lower") %>%
+ rename(country_name = location_name) %>% 
+  mutate(year = as.character(year))
+deaths %>%
+ summarize(n_countries = n_distinct(country_name),
+           n_years = n_distinct(year),
+           col_name = colnames(deaths),
+           n_missing = map(deaths, ~sum(is.na(.)))) %>%
+ unnest(n_missing)
+```
+
+The death dataset contains HIV death count data from 204 distinct countries, in the 30 years between 1990 and 2019.
+
+The deaths dataset contains `r nrow(deaths)` rows and `r ncol(deaths)` columns, with each row representing a single record of number of HIV deaths in a country stratified by year, sex and age group. Variables in the deaths dataset are as follows: `r colnames(deaths)`. 
+
+
+#### GDP Per Capita By Country Dataset
+
+```{r, message = FALSE,warning = FALSE}
+gdp = read_csv("data/final_gdp_per_capita.csv", skip = 4, col_names = TRUE) %>% 
+  janitor::clean_names() %>% 
+  drop_na(location_id) 
+names(gdp) <- sub('^x', '', names(gdp))
+gdp_clean = gdp %>%  
+  select("location_id", "country_name", "1990":"2019") %>% 
+  pivot_longer(cols = "1990":"2019",
+               names_to = "year",
+               values_to = "GDP_per_capita") 
+```
+The raw GDP dataset contains GDP per capita (US dollars) from 200 distinct countries, from 1960 to 2021. 
+
+The dataset contains `r nrow(gdp)` rows and `r ncol(gdp)` columns, with each row representing a single record of a country's GDP per capital (US dollars) in a given year. 
+
+
+#### Population By Country Dataset
+```{r, message = FALSE,warning = FALSE}
+population = read_csv("data/final_population_total.csv", skip = 4, col_names = TRUE)  %>% 
+  janitor::clean_names() %>% 
+  drop_na(location_id) 
+names(population) <- sub('^x', '', names(population))
+population_clean = population %>%  
+  select("location_id", "1990":"2019") %>% 
+  pivot_longer(cols = "1990":"2019",
+               names_to = "year",
+               values_to = "Population") 
+```
+
+The raw population dataset contains total population from 200 distinct countries, from 1960 to 2021. 
+
+The dataset contains `r nrow(population)` rows and `r ncol(population)` columns, with each row representing a single record of a country's population in a given year. 
+
+
+
+### Merging 3 datasets to produce the "maindata" dataset for visualization and analysis
+
+First, we merge the GDP Per Capita By Country dataset (`gdp_clean`) and Population By Country Dataset (`population_clean`) into a dataset called `gdp_population`. This combined dataset contains data from 200 distinct countries between 1990 and 2019.
+
+```{r, message = FALSE,warning = FALSE}
+gdp_population = inner_join(gdp_clean, population_clean, by = c("location_id", "year")) %>%
+ janitor::clean_names() 
+gdp_population %>%
+ summarize(n_countries = n_distinct(country_name),
+           n_years = n_distinct(year),
+           col_name = colnames(gdp_population),
+           n_missing = map(gdp_population, ~sum(is.na(.)))) %>%
+ unnest(n_missing)
+```
+
+Next, we merge the `gdp_population` dataset with the HIV Deaths dataset (`deaths`) into a `maindata` dataset by matching on the countries and years and using `left_join`. We save this as a CSV for further analysis.
+
+```{r, message = FALSE,warning = FALSE}
+maindata = left_join(gdp_population, deaths, by = c("year","location_id")) %>% 
+  select(-country_name.x, -age_id) %>% 
+  rename(country_name = country_name.y) %>% 
+  select(location_id, country_name, everything())
+maindata %>% 
+  summarize(n_countries = n_distinct(location_id),
+            n_years = n_distinct(year),
+            col_name = colnames(maindata),
+            n_missing = map(maindata, ~sum(is.na(.)))) %>% 
+  unnest(n_missing)
+write_csv(maindata, 'data/maindata.csv')
+```
+
+`maindata` has `r nrow(maindata)` observations and `r ncol(maindata)` features. Basic features we are interested in include:
+
+- **location_id**: id corresponding to a country_name
+- **sex_id**: id corresponding to sex
+- **sex_name**: Male or Female
+- **age_name**: Aae groups including "0-9 years", "10-24 years",  "25-49 years", "50-74 years", and "75+ years".
+- **year**: Year of the records
+- **val**: Point estimate of number of HIV/AIDS deaths
+- **upper**: Upper estimate of number of HIV/AIDS deaths
+- **lower**: Lower estimate of number of HIV/AIDS deaths
+- **gdp_per_capita** GDP per capita in 2022 US dollars
+- **population** population total
+- **country_name** name of country
+
+
+### Statistical analysis
+
+#### Create "motality_per_100k" and "log_motality_per_100k" variables
+
+```{r}
+regression = maindata %>% 
+  mutate(motality_per_100k = val / (population/100000),
+         log_motality_per_100k = log(motality_per_100k),
+         age_name = as.factor(age_name),
+         sex_name = as.factor(sex_name),
+         year = as.numeric(year),
+         year_2004 = if_else(year <= 2004, 1, 0),
+         year_2004 = as.factor(year_2004),
+         country_name = as.factor(country_name)) 
+
+regression %>% 
+  summarize(col_name = colnames(regression),
+            n_missing = map(regression, ~sum(is.na(.)))) %>% 
+  unnest(n_missing)
+
+```
+### Plots of the distribution to main outcome of interest(HIV mortality per 100k population).
+```{r}
+regression %>% 
+  ggplot(aes(x = motality_per_100k)) +
+  geom_histogram(color = "darkblue", fill = "lightblue") +
+  ggtitle("Histogram of HIV deaths per 100k") +
+  geom_vline( aes(xintercept = mean(motality_per_100k)),
+             linetype = "dashed") +
+  ylab("") +
+  xlab("Estimated HIV deaths per 100k")
+
+
+regression %>% 
+  ggplot(aes(x = log_motality_per_100k)) +
+  geom_histogram(color = "darkblue", fill = "lightblue") +
+  ggtitle("Histogram of log(HIV deaths per 100k)") +
+  geom_vline(aes(xintercept = mean(log_motality_per_100k)),
+             linetype = "dashed") +
+  ylab("") +
+  xlab("Estimated log(HIV deaths per 100k)")
+```
+### Logistic regression models
+
+### model1:
+
+$$ log(motality/100000) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year + \beta_4 gdp $$
+```{r}
+regression_logit = regression %>%
+  mutate(log_motality_per_100k = if_else(log_motality_per_100k == -Inf, 0.01, log_motality_per_100k))
+  
+model1_logit = lm(log_motality_per_100k ~ age_name + sex_name + year + gdp_per_capita, data = regression_logit) 
+
+kable(summary(model1_logit)$coefficients)
+
+```
+
+### model2:
+
+$$ log(motality/100000) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year + \beta_4year_{2004} + \beta_5gdp + \beta_6 year*year_{2004}  $$
+```{r}
+  
+model2_logit = lm(log_motality_per_100k ~ age_name + sex_name + year + year_2004 + gdp_per_capita + year*year_2004, data = regression_logit)
+
+kable(summary(model2_logit)$coefficients)
+
+```
+
+### model3:
+
+$$ log(motality/100000) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year_{2004} + \beta_4 gdp + \beta_5 age*sex $$
+
+```{r}
+model3_logit = lm(log_motality_per_100k ~ age_name + sex_name + year_2004 + gdp_per_capita + age_name*sex_name, data = regression_logit)
+
+kable(summary(model3_logit)$coefficients)
+
+```
+
+### model4:
+$$ log(motality/100000) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year_{2004} + \beta_4 gdp + \beta_5 age*sex + \beta_6 country$$
+
+```{r}
+model4_logit = lm(log_motality_per_100k ~ age_name + sex_name + year_2004 + gdp_per_capita + age_name*sex_name + country_name, data = regression_logit)
+
+kable(summary(model4_logit)$coefficients)
+
+```
+
+#### Poisson Regression models:
+
+### model1:
+
+$$ log(E(Y_i|age_i,sex_i,year_i,gdp_i)) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year + \beta_4 gdp $$
+```{r}
+regression_poisson = regression %>% 
+  mutate(val = as.integer(val))
+
+model1_poi = glm(val ~ age_name + sex_name + year + gdp_per_capita, family = "poisson", data = regression_poisson)
+
+kable(summary(model1_poi)$coefficients)
+```
+### model2:
+
+$$ log(E(Y_i|age_i,sex_i,year_i,year_{2004i},gdp_i)) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year + \beta_4 year_{2004} + \beta_5 gdp + \beta_6 year *year_{2004}$$
+```{r}
+model2_poi = glm(val ~ age_name + sex_name + year + year_2004 + gdp_per_capita + year*year_2004, family = "poisson", data = regression_poisson)
+
+kable(summary(model2_poi)$coefficients)
+```
+
+### model3:
+
+$$ log(E(Y_i|age_i,sex_i,year_{2004i},gdp_i)) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year_{2004} + \beta_4 gdp + \beta_5 age *sex$$
+```{r}
+model3_poi = glm(val ~ age_name + sex_name + year_2004 + gdp_per_capita + age_name*sex_name, data = regression_poisson)
+
+kable(summary(model3_logit)$coefficients)
+```
+
+### model4:
+
+$$ log(E(Y_i|age_i,sex_i,year_{2004i},gdp_i,country_i)) = \beta_0 + \beta_1 age + \beta_2 sex + \beta_3 year_{2004} + \beta_4 gdp + \beta_5 age *sex + \beta_6 country$$
+```{r}
+model4_logit = glm(val ~ age_name + sex_name + year_2004 + gdp_per_capita + age_name*sex_name + country_name, data = regression_poisson)
+
+kable(summary(model4_logit)$coefficients)
+```
+
+```{r}
+
+```
+
